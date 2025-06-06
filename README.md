@@ -1,1327 +1,823 @@
-```c#
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+POST {batchUrl}/pools?api-version=2024-07-01.20.0
 
-using System;
-using System.IO;
-using System.Threading.Tasks;
-using Azure.Storage.Blobs.Specialized;
-using Azure.Storage.Sas;
-using NUnit.Framework;
-using Azure.Core;
-using Azure.Identity;
-using Azure.Storage.Blobs.Models;
+POST {batchUrl}/jobs?api-version=2024-07-01.20.0
+
+GET {batchUrl}/nodecounts?api-version=2024-07-01.20.0
+GET account.region.batch.azure.com/nodecounts?api-version=2024-07-01.20.0
+﻿using Azure.Storage;
 using Azure.Storage.Blobs;
+using Azure.Storage.Sas;
+using Microsoft.Azure.Batch;
+using Microsoft.Azure.Batch.Auth;
+using Microsoft.Azure.Batch.Common;
+using System;
 using System.Collections.Generic;
-using System.Threading;
+using System.Diagnostics;
+using System.IO;
 
-namespace Azure.Storage.DataMovement.Blobs.Samples
+namespace BatchDotNetQuickstart
 {
-    /// <summary>
-    /// Basic Azure Blob Storage samples.
-    /// </summary>
-    public class Sample01b_HelloWorldAsync : SampleTest
+    public class Program
     {
-        public Random _rand = new Random();
+        // Update the Batch and Storage account credential strings below with the values unique to your accounts.
+        // These are used when constructing connection strings for the Batch and Storage client objects.
 
-        [Test]
-        public async Task ResourceConstructionDemonstration()
+        // Batch account credentials
+        private const string BatchAccountName = "";
+        private const string BatchAccountKey = "";
+        private const string BatchAccountUrl = "";
+
+        // Storage account credentials
+        private const string StorageAccountName = "";
+        private const string StorageAccountKey = "";
+
+        // Batch resource settings
+        private const string PoolId = "DotNetQuickstartPool";
+        private const string JobId = "DotNetQuickstartJob";
+        private const int PoolNodeCount = 2;
+        private const string PoolVMSize = "STANDARD_D1_V2";
+
+        static void Main()
         {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourceLocalPath = CreateTempFile(SampleFileContent);
-            string connectionString = ConnectionString;
-            string containerName = Randomize("sample-container");
+            if (string.IsNullOrEmpty(BatchAccountName) ||
+                string.IsNullOrEmpty(BatchAccountKey) ||
+                string.IsNullOrEmpty(BatchAccountUrl) ||
+                string.IsNullOrEmpty(StorageAccountName) ||
+                string.IsNullOrEmpty(StorageAccountKey))
+            {
+                throw new InvalidOperationException("One or more account credential strings have not been populated. Please ensure that your Batch and Storage account credentials have been specified.");
+            }
 
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient blobContainerClient = new BlobContainerClient(connectionString, containerName);
-            await blobContainerClient.CreateIfNotExistsAsync();
             try
             {
+                Console.WriteLine("Sample start: {0}", DateTime.Now);
+                Console.WriteLine();
+                var timer = new Stopwatch();
+                timer.Start();
+
+                // Create the blob client, for use in obtaining references to blob storage containers
+                var blobServiceClient = GetBlobServiceClient(StorageAccountName, StorageAccountKey);
+
+                // Use the blob client to create the input container in Azure Storage 
+                const string inputContainerName = "input";
+                var containerClient = blobServiceClient.GetBlobContainerClient(inputContainerName);
+                containerClient.CreateIfNotExistsAsync().Wait();
+
+                // The collection of data files that are to be processed by the tasks
+                List<string> inputFilePaths = new()
                 {
-                    TokenCredential tokenCredential = new DefaultAzureCredential();
+                    "taskdata0.txt",
+                    "taskdata1.txt",
+                    "taskdata2.txt"
+                };
 
-                    TransferManager transferManager = new TransferManager();
+                // Upload the data files to Azure Storage. This is the data that will be processed by each of the tasks that are
+                // executed on the compute nodes within the pool.
+                var inputFiles = new List<ResourceFile>();
 
-                    // Get blobs provider with credential
-                    #region Snippet:MakeProvider_TokenCredential
-                    BlobsStorageResourceProvider blobs = new(tokenCredential);
-                    #endregion
-
-                    // Get a reference to a destination blobs
-                    BlockBlobClient blockBlobClient = blobContainerClient.GetBlockBlobClient("sample-blob-block");
-                    PageBlobClient pageBlobClient = blobContainerClient.GetPageBlobClient("sample-blob-page");
-                    AppendBlobClient appendBlobClient = blobContainerClient.GetAppendBlobClient("sample-blob-append");
-
-                    // Construct simple blob resources for data movement
-                    #region Snippet:ResourceConstruction_Blobs
-                    StorageResource container = await blobs.FromContainerAsync(
-                        new Uri("https://myaccount.blob.core.windows.net/container"));
-
-                    // Block blobs are the default if no options are specified
-                    StorageResource blockBlob = await blobs.FromBlobAsync(
-                        new Uri("https://myaccount.blob.core.windows.net/container/sample-blob-block"),
-                        new BlockBlobStorageResourceOptions());
-                    StorageResource pageBlob = await blobs.FromBlobAsync(
-                        new Uri("https://myaccount.blob.core.windows.net/container/sample-blob-page"),
-                        new PageBlobStorageResourceOptions());
-                    StorageResource appendBlob = await blobs.FromBlobAsync(
-                        new Uri("https://myaccount.blob.core.windows.net/container/sample-blob-append"),
-                        new AppendBlobStorageResourceOptions());
-                    #endregion
+                foreach (var filePath in inputFilePaths)
+                {
+                    inputFiles.Add(UploadFileToContainer(containerClient, inputContainerName, filePath));
                 }
+
+                // Get a Batch client using account creds
+                var cred = new BatchSharedKeyCredentials(BatchAccountUrl, BatchAccountName, BatchAccountKey);
+
+                using BatchClient batchClient = BatchClient.Open(cred);
+                Console.WriteLine("Creating pool [{0}]...", PoolId);
+
+                // Create a Windows Server image, VM configuration, Batch pool
+                ImageReference imageReference = CreateImageReference();
+                VirtualMachineConfiguration vmConfiguration = CreateVirtualMachineConfiguration(imageReference);
+                CreateBatchPool(batchClient, vmConfiguration);
+
+                // Create a Batch job
+                Console.WriteLine("Creating job [{0}]...", JobId);
+
+                try
                 {
-                    StorageSharedKeyCredential sharedKeyCredential = new(StorageAccountName, StorageAccountKey);
-                    // Get blobs provider with credential
-                    ValueTask<AzureSasCredential> GenerateSas(Uri uri, CancellationToken cancellationToken)
+                    CloudJob job = batchClient.JobOperations.CreateJob();
+                    job.Id = JobId;
+                    job.PoolInformation = new PoolInformation { PoolId = PoolId };
+                    job.Commit();
+                }
+                catch (BatchException be)
+                {
+                    // Accept the specific error code JobExists as that is expected if the job already exists
+                    if (be.RequestInformation?.BatchError?.Code == BatchErrorCodeStrings.JobExists)
                     {
-                        // Construct your SAS according to your needs
-                        BlobUriBuilder blobUri = new(uri);
-                        BlobSasBuilder sas = new(BlobSasPermissions.All, DateTimeOffset.Now.AddHours(1))
-                        {
-                            BlobContainerName = blobUri.BlobContainerName,
-                            BlobName = blobUri.BlobName,
-                        };
-                        return new ValueTask<AzureSasCredential>(new AzureSasCredential(sas.ToSasQueryParameters(sharedKeyCredential).ToString()));
+                        Console.WriteLine("The job {0} already existed when we tried to create it", JobId);
                     }
-                    BlobsStorageResourceProvider blobs = new(GenerateSas);
-                }
-            }
-            finally
-            {
-                await blobContainerClient.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Various ways of constructing blob resources.
-        /// </summary>
-        [Test]
-        public async Task ConstructFromClientsDemonstration()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourceLocalPath = CreateTempFile(SampleFileContent);
-            string connectionString = ConnectionString;
-            string containerName = Randomize("sample-container");
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient blobContainerClient = new BlobContainerClient(connectionString, containerName);
-            await blobContainerClient.CreateIfNotExistsAsync();
-            try
-            {
-                TransferManager transferManager = new TransferManager();
-
-                // Get a reference to a source local file
-                StorageResource sourceResource = LocalFilesStorageResourceProvider.FromFile(sourceLocalPath);
-
-                // Get a reference to a destination blobs
-                BlockBlobClient blockBlobClient = blobContainerClient.GetBlockBlobClient("sample-blob-block");
-                PageBlobClient pageBlobClient = blobContainerClient.GetPageBlobClient("sample-blob-page");
-                AppendBlobClient appendBlobClient = blobContainerClient.GetAppendBlobClient("sample-blob-append");
-
-                await pageBlobClient.CreateAsync(Constants.KB);
-                await appendBlobClient.CreateAsync();
-
-                // Construct simple blob resources for data movement
-                #region Snippet:ResourceConstruction_FromClients_Blobs
-                StorageResource containerResource = BlobsStorageResourceProvider.FromClient(blobContainerClient);
-                StorageResource blockBlobResource = BlobsStorageResourceProvider.FromClient(blockBlobClient);
-                StorageResource pageBlobResource = BlobsStorageResourceProvider.FromClient(pageBlobClient);
-                StorageResource appendBlobResource = BlobsStorageResourceProvider.FromClient(appendBlobClient);
-                #endregion
-
-                // Construct a blob container resource that is scoped to a blob prefix (virtual directory).
-                #region Snippet:ResourceConstruction_Blobs_WithOptions_VirtualDirectory
-                BlobStorageResourceContainerOptions virtualDirectoryOptions = new()
-                {
-                    BlobPrefix = "blob/directory/prefix"
-                };
-
-                StorageResource virtualDirectoryResource = BlobsStorageResourceProvider.FromClient(
-                    blobContainerClient,
-                    virtualDirectoryOptions);
-                #endregion
-
-                // Construct a blob resource with given metadata
-                #region Snippet:ResourceConstruction_Blobs_WithOptions_BlockBlob
-                BlockBlobStorageResourceOptions resourceOptions = new()
-                {
-                    Metadata = new Dictionary<string, string>
-                        {
-                            { "key", "value" }
-                        }
-                };
-                StorageResource leasedBlockBlobResource = BlobsStorageResourceProvider.FromClient(
-                    blockBlobClient,
-                    resourceOptions);
-                #endregion
-            }
-            finally
-            {
-                await blobContainerClient.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use a connection string to connect to a Storage account and upload two single blobs.
-        /// </summary>
-        [Test]
-        public async Task UploadSingle_ConnectionStringAsync()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourceLocalPath = CreateTempFile(SampleFileContent);
-
-            // Get a connection string to our Azure Storage account.  You can
-            // obtain your connection string from the Azure Portal (click
-            // Access Keys under Settings in the Portal Storage account blade)
-            // or using the Azure CLI with:
-            //
-            //     az storage account show-connection-string --name <account_name> --resource-group <resource_group>
-            //
-            // And you can provide the connection string to your application
-            // using an environment variable.
-
-            TokenCredential tokenCredential = new DefaultAzureCredential();
-            string containerName = Randomize("sample-container");
-
-            BlobServiceClient serviceClient = new BlobServiceClient(ActiveDirectoryBlobUri, tokenCredential);
-            BlobContainerClient container = serviceClient.GetBlobContainerClient(containerName);
-            await container.CreateIfNotExistsAsync();
-            try
-            {
-                #region Snippet:CreateTransferManagerSimple_BasePackage
-                TransferManager transferManager = new TransferManager(new TransferManagerOptions());
-                #endregion
-
-                // Get a reference to a destination blobs
-                Uri destinationBlobUri = container.GetBlockBlobClient("sample-blob").Uri;
-
-                // Should be the same token credential as above, but for demonstration/sample purposes
-                // we include how we would get the token credential.
-                #region Snippet:SimpleBlobUpload_BasePackage
-                TokenCredential defaultTokenCredential = new DefaultAzureCredential();
-                BlobsStorageResourceProvider blobs = new BlobsStorageResourceProvider(defaultTokenCredential);
-
-                // Create simple transfer single blob upload job
-                #region Snippet:SimpleBlobUpload
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                    sourceResource: LocalFilesStorageResourceProvider.FromFile(sourceLocalPath),
-                    destinationResource: await blobs.FromBlobAsync(destinationBlobUri));
-                await transferOperation.WaitForCompletionAsync();
-                #endregion
-                #endregion
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use a shared key to access a Storage Account to download two separate blobs.
-        /// </summary>
-        [Test]
-        public async Task DownloadSingle_SharedKeyAuthAsync()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string originalPath = CreateTempFile(SampleFileContent);
-
-            // Get a temporary path on disk where we can download the file
-            string downloadPath = CreateTempPath();
-            string downloadPath2 = CreateTempPath();
-
-            // Get a Storage account name, shared key, and endpoint Uri.
-            //
-            // You can obtain both from the Azure Portal by clicking Access
-            // Keys under Settings in the Portal Storage account blade.
-            //
-            // You can also get access to your account keys from the Azure CLI
-            // with:
-            //
-            //     az storage account keys list --account-name <account_name> --resource-group <resource_group>
-            //
-            string accountName = StorageAccountName;
-            string accountKey = StorageAccountKey;
-            Uri serviceUri = StorageAccountBlobUri;
-            string containerName = Randomize("sample-container");
-
-            // Create a SharedKeyCredential that we can use to authenticate
-            TokenCredential tokenCredential = new DefaultAzureCredential();
-            StorageSharedKeyCredential credential = new StorageSharedKeyCredential(accountName, accountKey);
-
-            // Create a client that can authenticate with a SharedKeyCredential
-            BlobServiceClient service = new BlobServiceClient(serviceUri, credential);
-            BlobContainerClient container = service.GetBlobContainerClient(containerName);
-            await container.CreateIfNotExistsAsync();
-
-            try
-            {
-                // Get a reference to a source blobs and upload sample content to download
-                BlockBlobClient sourceBlobClient = container.GetBlockBlobClient("sample-blob");
-                Uri sourceBlobUri = sourceBlobClient.Uri;
-                BlockBlobClient sourceBlob2 = container.GetBlockBlobClient("sample-blob2");
-
-                using (FileStream stream = File.Open(originalPath, FileMode.Open))
-                {
-                    await sourceBlobClient.UploadAsync(stream);
-                    stream.Position = 0;
-                    await sourceBlob2.UploadAsync(stream);
-                }
-
-                // Create Blob Data Controller to skip through all failures
-                TransferManagerOptions options = new TransferManagerOptions()
-                {
-                    ErrorMode = TransferErrorMode.ContinueOnFailure
-                };
-                TransferManager transferManager = new TransferManager(options);
-                BlobsStorageResourceProvider blobs = new(tokenCredential);
-
-                // Simple Download Single Blob Job
-                #region Snippet:SimpleBlockBlobDownload
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                    sourceResource: await blobs.FromBlobAsync(sourceBlobUri),
-                    destinationResource: LocalFilesStorageResourceProvider.FromFile(downloadPath));
-                await transferOperation.WaitForCompletionAsync();
-                #endregion
-
-                StorageResource sourceResource2 = BlobsStorageResourceProvider.FromClient(sourceBlobClient);
-                StorageResource destinationResource2 = LocalFilesStorageResourceProvider.FromFile(downloadPath2);
-
-                await transferManager.StartTransferAsync(
-                    sourceResource: BlobsStorageResourceProvider.FromClient(sourceBlobClient, new BlockBlobStorageResourceOptions()
+                    else
                     {
-                        DestinationConditions = new BlobRequestConditions(){ LeaseId = "xyz" }
-                    }),
-                    destinationResource: LocalFilesStorageResourceProvider.FromFile(downloadPath2));
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use a shared access signature to access a Storage Account and upload a directory.
-        ///
-        /// A shared access signature (SAS) is a URI that grants restricted
-        /// access rights to Azure Storage resources. You can provide a shared
-        /// access signature to clients who should not be trusted with your
-        /// storage account key but to whom you wish to delegate access to
-        /// certain storage account resources. By distributing a shared access
-        /// signature URI to these clients, you can grant them access to a
-        /// resource for a specified period of time, with a specified set of
-        /// permissions.
-        /// </summary>
-        [Test]
-        public async Task UploadDirectory_SasAsync()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourcePath = CreateSampleDirectoryTree();
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourcePath2 = CreateSampleDirectoryTree();
-
-            // Create a service level SAS that only allows reading from service
-            // level APIs
-            AccountSasBuilder sas = new AccountSasBuilder
-            {
-                // Allow access to blobs
-                Services = AccountSasServices.Blobs,
-
-                // Allow access to the container level APIs
-                ResourceTypes = AccountSasResourceTypes.Container,
-
-                // Access expires in 1 hour!
-                ExpiresOn = DateTimeOffset.UtcNow.AddHours(1)
-            };
-            // Allow read, write, and delete access
-            AccountSasPermissions permissions = AccountSasPermissions.Read | AccountSasPermissions.Write | AccountSasPermissions.Delete;
-            sas.SetPermissions(permissions);
-
-            // Create a SharedKeyCredential that we can use to sign the SAS token
-            StorageSharedKeyCredential credential = new StorageSharedKeyCredential(StorageAccountName, StorageAccountKey);
-
-            // Build a SAS URI
-            UriBuilder sasUri = new UriBuilder(StorageAccountBlobUri);
-            sasUri.Query = sas.ToSasQueryParameters(credential).ToString();
-
-            // Create a client that can authenticate with the SAS URI
-            BlobServiceClient service = new BlobServiceClient(sasUri.Uri);
-
-            string containerName = Randomize("sample-container");
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient blobContainerClient = service.GetBlobContainerClient(containerName);
-
-            // Make a service request to verify we've successfully authenticated
-            await blobContainerClient.CreateIfNotExistsAsync();
-            Uri blobContainerUri = blobContainerClient.Uri;
-
-            // Prepare for upload
-            try
-            {
-                BlobsStorageResourceProvider blobs = new(new StorageSharedKeyCredential(StorageAccountName, StorageAccountKey));
-
-                // Create BlobTransferManager with event handler in Options bag
-                TransferManagerOptions transferManagerOptions = new TransferManagerOptions();
-                TransferOptions options = new TransferOptions()
-                {
-                    MaximumTransferChunkSize = 4 * Constants.MB,
-                    CreationMode = StorageResourceCreationMode.OverwriteIfExists,
-                };
-                TransferManager transferManager = new TransferManager(transferManagerOptions);
-
-                // Create simple transfer directory upload job which uploads the directory and the contents of that directory
-                string optionalDestinationPrefix = "sample-directory2";
-                #region Snippet:SimpleDirectoryUpload
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                    sourceResource: LocalFilesStorageResourceProvider.FromDirectory(sourcePath),
-                    destinationResource: await blobs.FromContainerAsync(
-                        blobContainerUri,
-                        new BlobStorageResourceContainerOptions()
-                        {
-                            // Block blobs are the default if not specified
-                            BlobType = BlobType.Block,
-                            BlobPrefix = optionalDestinationPrefix,
-                        }));
-                #endregion
-            }
-            finally
-            {
-                await blobContainerClient.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use a shared access signature to access  a Storage Account and upload a directory.
-        ///
-        /// A shared access signature (SAS) is a URI that grants restricted
-        /// access rights to Azure Storage resources. You can provide a shared
-        /// access signature to clients who should not be trusted with your
-        /// storage account key but to whom you wish to delegate access to
-        /// certain storage account resources. By distributing a shared access
-        /// signature URI to these clients, you can grant them access to a
-        /// resource for a specified period of time, with a specified set of
-        /// permissions.
-        /// </summary>
-        [Test]
-        public async Task UploadDirectory_CompletedEventHandler()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourcePath = CreateSampleDirectoryTree();
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourcePath2 = CreateSampleDirectoryTree();
-
-            string logFile = Path.GetTempFileName();
-
-            // Create a service level SAS that only allows reading from service
-            // level APIs
-            AccountSasBuilder sas = new AccountSasBuilder
-            {
-                // Allow access to blobs
-                Services = AccountSasServices.Blobs,
-
-                // Allow access to the container level APIs
-                ResourceTypes = AccountSasResourceTypes.Container,
-
-                // Access expires in 1 hour!
-                ExpiresOn = DateTimeOffset.UtcNow.AddHours(1)
-            };
-            // Allow read, write, and delete access
-            AccountSasPermissions permissions = AccountSasPermissions.Read | AccountSasPermissions.Write | AccountSasPermissions.Delete;
-            sas.SetPermissions(permissions);
-
-            // Create a SharedKeyCredential that we can use to sign the SAS token
-            StorageSharedKeyCredential credential = new StorageSharedKeyCredential(StorageAccountName, StorageAccountKey);
-
-            // Build a SAS URI
-            UriBuilder sasUri = new UriBuilder(StorageAccountBlobUri);
-            sasUri.Query = sas.ToSasQueryParameters(credential).ToString();
-
-            // Create a client that can authenticate with the SAS URI
-            BlobServiceClient service = new BlobServiceClient(sasUri.Uri);
-
-            string connectionString = ConnectionString;
-            string containerName = Randomize("sample-container");
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient container = service.GetBlobContainerClient(containerName);
-
-            // Make a service request to verify we've successfully authenticated
-            await container.CreateIfNotExistsAsync();
-
-            // Prepare for upload
-            try
-            {
-                // Create BlobTransferManager with event handler in Options bag
-                TransferManagerOptions options = new TransferManagerOptions();
-                TransferOptions transferOptions = new TransferOptions();
-                transferOptions.ItemTransferCompleted += (TransferItemCompletedEventArgs args) =>
-                {
-                    using (StreamWriter logStream = File.AppendText(logFile))
-                    {
-                        logStream.WriteLine($"File Completed Transfer: {args.Source.Uri.AbsoluteUri}");
+                        throw; // Any other exception is unexpected
                     }
-                    return Task.CompletedTask;
-                };
-                TransferManager transferManager = new TransferManager(options);
-
-                // Create simple transfer directory upload job which uploads the directory and the contents of that directory
-                TransferOperation uploadDirectoryJobId = await transferManager.StartTransferAsync(
-                    LocalFilesStorageResourceProvider.FromDirectory(sourcePath),
-                    BlobsStorageResourceProvider.FromClient(
-                        container,
-                        new BlobStorageResourceContainerOptions() { BlobPrefix = "sample-blob-directory" }));
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use a shared access signature to access  a Storage Account and upload a directory.
-        ///
-        /// A shared access signature (SAS) is a URI that grants restricted
-        /// access rights to Azure Storage resources. You can provide a shared
-        /// access signature to clients who should not be trusted with your
-        /// storage account key but to whom you wish to delegate access to
-        /// certain storage account resources. By distributing a shared access
-        /// signature URI to these clients, you can grant them access to a
-        /// resource for a specified period of time, with a specified set of
-        /// permissions.
-        /// </summary>
-        [Test]
-        public async Task UploadDirectory_EventHandler_SasAsync()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourcePath = CreateSampleDirectoryTree();
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string sourcePath2 = CreateSampleDirectoryTree();
-
-            string logFile = Path.GetTempFileName();
-
-            // Create a service level SAS that only allows reading from service
-            // level APIs
-            AccountSasBuilder sas = new AccountSasBuilder
-            {
-                // Allow access to blobs
-                Services = AccountSasServices.Blobs,
-
-                // Allow access to the container level APIs
-                ResourceTypes = AccountSasResourceTypes.Container,
-
-                // Access expires in 1 hour!
-                ExpiresOn = DateTimeOffset.UtcNow.AddHours(1)
-            };
-            // Allow read, write, and delete access
-            AccountSasPermissions permissions = AccountSasPermissions.Read | AccountSasPermissions.Write | AccountSasPermissions.Delete;
-            sas.SetPermissions(permissions);
-
-            // Create a SharedKeyCredential that we can use to sign the SAS token
-            StorageSharedKeyCredential credential = new StorageSharedKeyCredential(StorageAccountName, StorageAccountKey);
-
-            // Build a SAS URI
-            UriBuilder sasUri = new UriBuilder(StorageAccountBlobUri);
-            sasUri.Query = sas.ToSasQueryParameters(credential).ToString();
-
-            // Create a client that can authenticate with the SAS URI
-            BlobServiceClient service = new BlobServiceClient(sasUri.Uri);
-
-            string connectionString = ConnectionString;
-            string containerName = Randomize("sample-container");
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient container = service.GetBlobContainerClient(containerName);
-
-            // Make a service request to verify we've successfully authenticated
-            await container.CreateIfNotExistsAsync();
-
-            // Prepare for upload
-            try
-            {
-                // Create BlobTransferManager with event handler in Options bag
-                TransferManagerOptions options = new TransferManagerOptions();
-                TransferOptions transferOptions = new TransferOptions();
-                transferOptions.TransferStatusChanged += (TransferStatusEventArgs args) =>
-                {
-                    if (args.TransferStatus.HasCompletedSuccessfully)
-                    {
-                        using (StreamWriter logStream = File.AppendText(logFile))
-                        {
-                            logStream.WriteLine($"Our transfer has completed!");
-                        }
-                    }
-                    return Task.CompletedTask;
-                };
-                #region Snippet:LogIndividualTransferFailures
-                transferOptions.ItemTransferFailed += (TransferItemFailedEventArgs args) =>
-                {
-                    using (StreamWriter logStream = File.AppendText(logFile))
-                    {
-                        // Specifying specific resources that failed, since its a directory transfer
-                        // maybe only one file failed out of many
-                        logStream.WriteLine($"Exception occurred with TransferId: {args.TransferId}," +
-                            $"Source Resource: {args.Source.Uri.AbsoluteUri}, +" +
-                            $"Destination Resource: {args.Destination.Uri.AbsoluteUri}," +
-                            $"Exception Message: {args.Exception.Message}");
-                    }
-                    return Task.CompletedTask;
-                };
-                #endregion
-                TransferManager transferManager = new TransferManager(options);
-
-                // Create simple transfer directory upload job which uploads the directory and the contents of that directory
-                TransferOperation uploadDirectoryJobId = await transferManager.StartTransferAsync(
-                    LocalFilesStorageResourceProvider.FromDirectory(sourcePath),
-                    BlobsStorageResourceProvider.FromClient(
-                        container,
-                        new BlobStorageResourceContainerOptions() { BlobPrefix = "sample-blob-directory" }));
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use an Active Directory token to access a Storage account to download a directory
-        ///
-        /// Azure Storage provides integration with Azure Active Directory
-        /// (Azure AD) for identity-based authentication of requests to the
-        /// Blob and Queue services. With Azure AD, you can use role-based
-        /// access control (RBAC) to grant access to your Azure Storage
-        /// resources to users, groups, or applications. You can grant
-        /// permissions that are scoped to the level of an individual
-        /// container or queue.
-        ///
-        /// To learn more about Azure AD integration in Azure Storage, see
-        /// https://docs.microsoft.com/en-us/azure/storage/common/storage-auth-aad
-        /// </summary>
-        [Test]
-        public async Task DownloadDirectory_EventHandler_ActiveDirectoryAuthAsync()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can download our contents to
-            string downloadPath = CreateSampleDirectoryTree();
-            string downloadPath2 = CreateSampleDirectoryTree();
-
-            // Create a token credential that can use our Azure Active
-            // Directory application to authenticate with Azure Storage
-            TokenCredential tokenCredential = new DefaultAzureCredential();
-
-            // Create a client that can authenticate using our token credential
-            BlobServiceClient service = new BlobServiceClient(ActiveDirectoryBlobUri, tokenCredential);
-            string containerName = Randomize("sample-container");
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient blobContainerClient = service.GetBlobContainerClient(containerName);
-            Uri blobContainerUri = blobContainerClient.Uri;
-
-            // Make a service request to verify we've successfully authenticated
-            await blobContainerClient.CreateIfNotExistsAsync();
-
-            // Prepare to download
-            try
-            {
-                // Get a reference to a source blobs and upload sample content to download
-                StorageResource sourceDirectory = BlobsStorageResourceProvider.FromClient(blobContainerClient,
-                    new BlobStorageResourceContainerOptions() { BlobPrefix = "sample-blob-directory" });
-                StorageResource sourceDirectory2 = BlobsStorageResourceProvider.FromClient(blobContainerClient,
-                    new BlobStorageResourceContainerOptions() { BlobPrefix = "sample-blob-directory2" });
-                StorageResource destinationDirectory = LocalFilesStorageResourceProvider.FromDirectory(downloadPath);
-                StorageResource destinationDirectory2 = LocalFilesStorageResourceProvider.FromDirectory(downloadPath2);
-
-                // Upload a couple of blobs so we have something to list
-                await blobContainerClient.UploadBlobAsync("first", File.OpenRead(CreateTempFile()));
-                await blobContainerClient.UploadBlobAsync("first/fourth", File.OpenRead(CreateTempFile()));
-                await blobContainerClient.UploadBlobAsync("first/fifth", File.OpenRead(CreateTempFile()));
-                await blobContainerClient.UploadBlobAsync("second", File.OpenRead(CreateTempFile()));
-                await blobContainerClient.UploadBlobAsync("third", File.OpenRead(CreateTempFile()));
-
-                // Create BlobTransferManager with event handler in Options bag
-                TransferManagerOptions options = new TransferManagerOptions();
-                TransferOptions downloadOptions = new TransferOptions();
-                downloadOptions.ItemTransferFailed += async (TransferItemFailedEventArgs args) =>
-                {
-                    // Log Exception Message
-                    Console.WriteLine(args.Exception.Message);
-                    // Remove stub
-                    await Task.CompletedTask;
-                };
-                TransferManager transferManager = new TransferManager(options);
-
-                // Simple Download Directory Job where we upload the directory and it's contents
-                await transferManager.StartTransferAsync(
-                    sourceDirectory, destinationDirectory);
-
-                // Create different download transfer
-                string optionalSourcePrefix = "sample-blob-directory2";
-                BlobsStorageResourceProvider blobs = new(tokenCredential);
-                #region Snippet:SimpleDirectoryDownload_Blob
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                    sourceResource: await blobs.FromContainerAsync(
-                        blobContainerUri,
-                        new BlobStorageResourceContainerOptions()
-                        {
-                            BlobPrefix = optionalSourcePrefix
-                        }),
-                    destinationResource: LocalFilesStorageResourceProvider.FromDirectory(downloadPath));
-                await transferOperation.WaitForCompletionAsync();
-                #endregion
-            }
-            finally
-            {
-                await blobContainerClient.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use a connection string to connect to a Storage account and upload two single blobs.
-        /// </summary>
-        [Test]
-        public async Task CopySingle_ConnectionStringAsync()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string originalPath = CreateTempFile(SampleFileContent);
-
-            // Get a connection string to our Azure Storage account.  You can
-            // obtain your connection string from the Azure Portal (click
-            // Access Keys under Settings in the Portal Storage account blade)
-            // or using the Azure CLI with:
-            //
-            //     az storage account show-connection-string --name <account_name> --resource-group <resource_group>
-            //
-            // And you can provide the connection string to your application
-            // using an environment variable.
-
-            string connectionString = ConnectionString;
-            string containerName = Randomize("sample-container");
-            TokenCredential tokenCredential = new DefaultAzureCredential();
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient container = new BlobContainerClient(connectionString, containerName);
-
-            // Make a service request to verify we've successfully authenticated
-            await container.CreateIfNotExistsAsync();
-            await container.SetAccessPolicyAsync(PublicAccessType.BlobContainer);
-
-            // Prepare to copy
-            try
-            {
-                // Get a reference to a destination blobs
-                BlockBlobClient sourceBlockBlobClient = container.GetBlockBlobClient("sample-blob");
-                Uri sourceBlobUri = sourceBlockBlobClient.Uri;
-
-                using (FileStream stream = File.Open(originalPath, FileMode.Open))
-                {
-                    await sourceBlockBlobClient.UploadAsync(stream);
-                    stream.Position = 0;
                 }
 
-                AppendBlobClient destinationAppendBlobClient = container.GetAppendBlobClient("sample-blob2");
-                Uri destinationBlobUri = destinationAppendBlobClient.Uri;
+                // Create a collection to hold the tasks that we'll be adding to the job
+                Console.WriteLine("Adding {0} tasks to job [{1}]...", inputFiles.Count, JobId);
+                var tasks = new List<CloudTask>();
 
-                // Upload file data
-                TransferManager transferManager = new TransferManager(default);
-                BlobsStorageResourceProvider blobs = new(tokenCredential);
-
-                // Create simple transfer single blob upload job
-                #region Snippet:s2sCopyBlob
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                    sourceResource: await blobs.FromBlobAsync(sourceBlobUri),
-                    destinationResource: await blobs.FromBlobAsync(destinationBlobUri, new AppendBlobStorageResourceOptions()));
-                await transferOperation.WaitForCompletionAsync();
-                #endregion
-
-                Assert.IsTrue(await destinationAppendBlobClient.ExistsAsync());
-                Assert.AreEqual(TransferState.Completed, transferOperation.Status.State);
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use a shared key to access a Storage Account to download two single directories.
-        /// </summary>
-        [Test]
-        public async Task CopyDirectory()
-        {
-            // Create a temporary Lorem Ipsum file on disk that we can upload
-            string originalPath = CreateTempFile(SampleFileContent);
-
-            // Get a temporary path on disk where we can download the file
-            string downloadPath = CreateTempPath();
-            string downloadPath2 = CreateTempPath();
-
-            // Get a Storage account name, shared key, and endpoint Uri.
-            //
-            // You can obtain both from the Azure Portal by clicking Access
-            // Keys under Settings in the Portal Storage account blade.
-            //
-            // You can also get access to your account keys from the Azure CLI
-            // with:
-            //
-            //     az storage account keys list --account-name <account_name> --resource-group <resource_group>
-            //
-            string accountName = StorageAccountName;
-            string accountKey = StorageAccountKey;
-            Uri serviceUri = StorageAccountBlobUri;
-            string containerName = Randomize("sample-container");
-
-            // Create a SharedKeyCredential that we can use to authenticate
-            TokenCredential tokenCredential = new DefaultAzureCredential();
-
-            // Create a client that can authenticate with a connection string
-            BlobServiceClient service = new BlobServiceClient(serviceUri, tokenCredential);
-            BlobContainerClient container = service.GetBlobContainerClient(containerName);
-            Uri sourceContainerUri = container.Uri;
-            Uri destinationContainerUri = container.Uri;
-
-            // Make a service request to verify we've successfully authenticated
-            await container.CreateIfNotExistsAsync();
-
-            // Prepare to copy directory
-            try
-            {
-                string sourceDirectoryName = "sample-blob-directory";
-                string sourceDirectoryName2 = "sample-blob-directory2";
-
-                // Get a reference to a source blobs and upload sample content to download
-                StorageResource sourceDirectory1 = BlobsStorageResourceProvider.FromClient(container,
-                    new BlobStorageResourceContainerOptions() { BlobPrefix = sourceDirectoryName });
-                StorageResource sourceDirectory2 = BlobsStorageResourceProvider.FromClient(container,
-                    new BlobStorageResourceContainerOptions() { BlobPrefix = sourceDirectoryName2 });
-
-                // Create destination paths
-                StorageResource destinationDirectory1 = LocalFilesStorageResourceProvider.FromDirectory(downloadPath);
-                StorageResource destinationDirectory2 = LocalFilesStorageResourceProvider.FromDirectory(downloadPath2);
-
-                // Upload a couple of blobs so we have something to list
-                await container.UploadBlobAsync($"{sourceDirectoryName}/fourth", File.OpenRead(originalPath));
-                await container.UploadBlobAsync($"{sourceDirectoryName}/fifth", File.OpenRead(originalPath));
-                await container.UploadBlobAsync($"{sourceDirectoryName}/sixth", File.OpenRead(originalPath));
-                await container.UploadBlobAsync($"{sourceDirectoryName2}/seventh", File.OpenRead(originalPath));
-                await container.UploadBlobAsync($"{sourceDirectoryName2}/eight", File.OpenRead(originalPath));
-                await container.UploadBlobAsync($"{sourceDirectoryName2}/ninth", File.OpenRead(originalPath));
-
-                // Create Blob Transfer Manager
-                TransferManager transferManager = new TransferManager(default);
-#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-                TransferOptions options = new TransferOptions();
-                options.ItemTransferFailed += async (TransferItemFailedEventArgs args) =>
+                // Create each of the tasks to process one of the input files. 
+                for (int i = 0; i < inputFiles.Count; i++)
                 {
-                    //await LogFailedFileAsync(args.SourceFileUri, args.DestinationFileClient.Uri, args.Exception.Message);
-                };
-#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
-                BlobsStorageResourceProvider blobs = new(tokenCredential);
+                    string taskId = string.Format("Task{0}", i);
+                    string inputFilename = inputFiles[i].FilePath;
+                    string taskCommandLine = string.Format("cmd /c type {0}", inputFilename);
 
-                // this is just a directory copy within a container, but they can be separate containers as well
-                BlobContainerClient sourceContainer = container;
-                BlobContainerClient destinationContainer = container;
-                #region Snippet:s2sCopyBlobContainer
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                sourceResource: await blobs.FromContainerAsync(
-                    sourceContainerUri,
-                    new BlobStorageResourceContainerOptions()
+                    var task = new CloudTask(taskId, taskCommandLine)
                     {
-                        BlobPrefix = sourceDirectoryName
-                    }),
-                destinationResource: await blobs.FromContainerAsync(
-                    destinationContainerUri,
-                    new BlobStorageResourceContainerOptions()
-                    {
-                        // all source blobs will be copied as a single type of destination blob
-                        // defaults to block blobs if unspecified
-                        BlobType = BlobType.Block,
-                        BlobPrefix = downloadPath
-                    }));
-                await transferOperation.WaitForCompletionAsync();
-                #endregion
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Test to show pause and resume tests
-        /// </summary>
-        [Test]
-        public async Task PauseAndResumeAsync_ManagerId()
-        {
-            string connectionString = ConnectionString;
-            string containerName = Randomize("sample-container");
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient container = new BlobContainerClient(connectionString, containerName);
-            await container.CreateIfNotExistsAsync();
-            try
-            {
-                string downloadPath = CreateTempPath();
-                // Get a temporary path on disk where we can download the file
-                //@@ string downloadPath = "hello.jpg";
-
-                // Download the public MacBeth copy at https://www.gutenberg.org/cache/epub/1533/pg1533.txt
-                BlockBlobClient sourceBlob = new BlockBlobClient(new Uri("https://www.gutenberg.org/cache/epub/1533/pg1533.txt"));
-                await sourceBlob.DownloadToAsync(downloadPath);
-
-                // Create a token credential that can use our Azure Active
-                // Directory application to authenticate with Azure Storage
-
-                // Create transfer manager
-                #region Snippet:SetupTransferManagerForResume
-                TokenCredential tokenCredential = new DefaultAzureCredential();
-                BlobsStorageResourceProvider blobs = new(tokenCredential);
-                TransferManager transferManager = new(new TransferManagerOptions()
-                {
-                    ProvidersForResuming = new List<StorageResourceProvider>() { blobs },
-                });
-                #endregion
-
-                // Create source and destination resource
-                StorageResource sourceResource = BlobsStorageResourceProvider.FromClient(sourceBlob);
-                StorageResource destinationResource = LocalFilesStorageResourceProvider.FromFile(downloadPath);
-
-                // Create simple transfer single blob download job
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                    sourceResource: sourceResource,
-                    destinationResource: destinationResource);
-                string transferId = transferOperation.Id;
-
-                // Pause from the Transfer Manager using the Transfer Id
-                #region Snippet:PauseFromManager
-                await transferManager.PauseTransferAsync(transferId);
-                #endregion
-
-                #region Snippet:ResumeAllTransfers
-                // Resume all transfers
-                List<TransferOperation> transfers = await transferManager.ResumeAllTransfersAsync();
-                #endregion
-
-                // Resume a single transfer
-                #region Snippet:DataMovement_ResumeSingle
-                TransferOperation resumedTransfer = await transferManager.ResumeTransferAsync(transferId);
-                #endregion
-
-                // Wait for download to finish
-                await resumedTransfer.WaitForCompletionAsync();
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Test to show pause and resume tests
-        /// </summary>
-        [Test]
-        public async Task PauseAndResumeAsync_DataTransferPause()
-        {
-            string connectionString = ConnectionString;
-            TokenCredential tokenCredential = new DefaultAzureCredential();
-            string containerName = Randomize("sample-container");
-
-            // Create a client that can authenticate with a connection string
-            BlobContainerClient container = new BlobContainerClient(connectionString, containerName);
-            await container.CreateIfNotExistsAsync();
-            try
-            {
-                string downloadPath = CreateTempPath();
-                // Get a temporary path on disk where we can download the file
-                //@@ string downloadPath = "hello.jpg";
-
-                // Download the public MacBeth copy at https://www.gutenberg.org/cache/epub/1533/pg1533.txt
-                BlockBlobClient sourceBlob = new BlockBlobClient(new Uri("https://www.gutenberg.org/cache/epub/1533/pg1533.txt"));
-                await sourceBlob.DownloadToAsync(downloadPath);
-
-                // Create transfer manager
-                BlobsStorageResourceProvider blobs = new(tokenCredential);
-                TransferManagerOptions options = new TransferManagerOptions();
-                options.ProvidersForResuming = new List<StorageResourceProvider>() { blobs };
-                TransferManager transferManager = new TransferManager(options);
-
-                // Create source and destination resource
-                StorageResource sourceResource = BlobsStorageResourceProvider.FromClient(sourceBlob);
-                StorageResource destinationResource = LocalFilesStorageResourceProvider.FromFile(downloadPath);
-
-                // Create simple transfer single blob download job
-                TransferOperation transferOperation = await transferManager.StartTransferAsync(
-                    sourceResource: sourceResource,
-                    destinationResource: destinationResource);
-
-                // Pause from the TransferOperation object
-                #region Snippet:PauseFromTransfer
-                await transferOperation.PauseAsync();
-                #endregion
-
-                TransferOperation resumedTransfer = await transferManager.ResumeTransferAsync(
-                transferId: transferOperation.Id);
-
-                // Wait for download to finish
-                await resumedTransfer.WaitForCompletionAsync();
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        /// <summary>
-        /// Use the <see cref="BlobContainerClient.UploadDirectory"/> extension method to upload an entire directory.
-        /// </summary>
-        [Test]
-        public async Task UploadDirectory()
-        {
-            string localPath = CreateSampleDirectoryTree();
-
-            string accountName = StorageAccountName;
-            string accountKey = StorageAccountKey;
-            Uri serviceUri = StorageAccountBlobUri;
-            string containerName = Randomize("sample-container");
-            string blobDirectoryPrefix = Path.GetDirectoryName(localPath);
-            // Create a SharedKeyCredential that we can use to authenticate
-            StorageSharedKeyCredential credential = new StorageSharedKeyCredential(accountName, accountKey);
-
-            #region Snippet:ExtensionMethodCreateContainerClient
-            BlobServiceClient service = new BlobServiceClient(serviceUri, credential);
-
-            BlobContainerClient container = service.GetBlobContainerClient(containerName);
-            #endregion
-
-            // Make a service request to verify we've successfully authenticated
-            await container.CreateIfNotExistsAsync();
-
-            try
-            {
-                {
-                    // upload files to the root of the container
-                    #region Snippet:ExtensionMethodSimpleUploadToRoot
-                    TransferOperation transfer = await container.UploadDirectoryAsync(WaitUntil.Started, localPath);
-
-                    await transfer.WaitForCompletionAsync();
-                    #endregion
-                }
-                {
-                    // upload files with to a specific directory prefix
-                    #region Snippet:ExtensionMethodSimpleUploadToDirectoryPrefix
-                    TransferOperation transfer = await container.UploadDirectoryAsync(WaitUntil.Started, localPath, blobDirectoryPrefix);
-
-                    await transfer.WaitForCompletionAsync();
-                    #endregion
-                }
-                {
-                    #region Snippet:ExtensionMethodSimpleUploadWithOptions
-                    BlobContainerClientTransferOptions options = new BlobContainerClientTransferOptions
-                    {
-                        BlobContainerOptions = new BlobStorageResourceContainerOptions
-                        {
-                            BlobPrefix = blobDirectoryPrefix
-                        },
-                        TransferOptions = new TransferOptions()
-                        {
-                            CreationMode = StorageResourceCreationMode.OverwriteIfExists,
-                        }
+                        ResourceFiles = new List<ResourceFile> { inputFiles[i] }
                     };
-
-                    TransferOperation transfer = await container.UploadDirectoryAsync(WaitUntil.Started, localPath, options);
-
-                    await transfer.WaitForCompletionAsync();
-                    #endregion
+                    tasks.Add(task);
                 }
+
+                // Add all tasks to the job.
+                batchClient.JobOperations.AddTask(JobId, tasks);
+
+                // Monitor task success/failure, specifying a maximum amount of time to wait for the tasks to complete.
+                TimeSpan timeout = TimeSpan.FromMinutes(30);
+                Console.WriteLine("Monitoring all tasks for 'Completed' state, timeout in {0}...", timeout);
+
+                IEnumerable<CloudTask> addedTasks = batchClient.JobOperations.ListTasks(JobId);
+                batchClient.Utilities.CreateTaskStateMonitor().WaitAll(addedTasks, TaskState.Completed, timeout);
+                Console.WriteLine("All tasks reached state Completed.");
+
+                // Print task output
+                Console.WriteLine();
+                Console.WriteLine("Printing task output...");
+
+                IEnumerable<CloudTask> completedtasks = batchClient.JobOperations.ListTasks(JobId);
+                foreach (CloudTask task in completedtasks)
+                {
+                    string nodeId = string.Format(task.ComputeNodeInformation.ComputeNodeId);
+                    Console.WriteLine("Task: {0}", task.Id);
+                    Console.WriteLine("Node: {0}", nodeId);
+                    Console.WriteLine("Standard out:");
+                    Console.WriteLine(task.GetNodeFile(Constants.StandardOutFileName).ReadAsString());
+                }
+
+                // Print out some timing info
+                timer.Stop();
+                Console.WriteLine();
+                Console.WriteLine("Sample end: {0}", DateTime.Now);
+                Console.WriteLine("Elapsed time: {0}", timer.Elapsed);
+
+                // Clean up Storage resources
+                containerClient.DeleteIfExistsAsync().Wait();
+                Console.WriteLine("Container [{0}] deleted.", inputContainerName);
+
+                // Clean up Batch resources (if the user so chooses)
+                Console.WriteLine();
+                Console.Write("Delete job? [yes] no: ");
+                string response = Console.ReadLine().ToLower();
+                if (response != "n" && response != "no")
+                {
+                    batchClient.JobOperations.DeleteJob(JobId);
+                }
+
+                Console.Write("Delete pool? [yes] no: ");
+                response = Console.ReadLine().ToLower();
+                if (response != "n" && response != "no")
+                {
+                    batchClient.PoolOperations.DeletePool(PoolId);
+                }
+            }
+            catch(Exception e) 
+            {
+                Console.WriteLine(e.Message);
             }
             finally
             {
-                await container.DeleteIfExistsAsync();
+                Console.WriteLine();
+                Console.WriteLine("Sample complete, hit ENTER to exit...");
+                Console.ReadLine();
             }
+        }
+
+        private static void CreateBatchPool(BatchClient batchClient, VirtualMachineConfiguration vmConfiguration)
+        {
+            try
+            {
+                CloudPool pool = batchClient.PoolOperations.CreatePool(
+                    poolId: PoolId,
+                    targetDedicatedComputeNodes: PoolNodeCount,
+                    virtualMachineSize: PoolVMSize,
+                    virtualMachineConfiguration: vmConfiguration);
+
+                pool.Commit();
+            }
+            catch (BatchException be)
+            {
+                // Accept the specific error code PoolExists as that is expected if the pool already exists
+                if (be.RequestInformation?.BatchError?.Code == BatchErrorCodeStrings.PoolExists)
+                {
+                    Console.WriteLine("The pool {0} already existed when we tried to create it", PoolId);
+                }
+                else
+                {
+                    throw; // Any other exception is unexpected
+                }
+            }
+        }
+
+        private static VirtualMachineConfiguration CreateVirtualMachineConfiguration(ImageReference imageReference)
+        {
+            return new VirtualMachineConfiguration(
+                imageReference: imageReference,
+                nodeAgentSkuId: "batch.node.windows amd64");
+        }
+
+        private static ImageReference CreateImageReference()
+        {
+            return new ImageReference(
+                publisher: "MicrosoftWindowsServer",
+                offer: "WindowsServer",
+                sku: "2016-datacenter-smalldisk",
+                version: "latest");
         }
 
         /// <summary>
-        /// Use the <see cref="BlobContainerClient.UploadDirectory"/> extension method to upload an entire directory.
+        /// Creates a blob client
         /// </summary>
-        [Test]
-        public async Task DownloadDirectory()
+        /// <param name="storageAccountName">The name of the Storage Account</param>
+        /// <param name="storageAccountKey">The key of the Storage Account</param>
+        /// <returns></returns>
+        private static BlobServiceClient GetBlobServiceClient(string storageAccountName, string storageAccountKey)
         {
-            string localDirectoryPath = CreateTempDirectoryPath();
-            string localDirectoryPath2 = CreateTempDirectoryPath();
-            string accountName = StorageAccountName;
-            string accountKey = StorageAccountKey;
-            Uri serviceUri = StorageAccountBlobUri;
-            string containerName = Randomize("sample-container");
+            var sharedKeyCredential = new StorageSharedKeyCredential(storageAccountName, storageAccountKey);
+            string blobUri = "https://" + storageAccountName + ".blob.core.windows.net";
 
-            // Create a SharedKeyCredential that we can use to authenticate
-            StorageSharedKeyCredential credential = new StorageSharedKeyCredential(accountName, accountKey);
+            var blobServiceClient = new BlobServiceClient(new Uri(blobUri), sharedKeyCredential);
+            return blobServiceClient;
+        }
 
-            // Create a client that can authenticate with a connection string
-            BlobServiceClient service = new BlobServiceClient(serviceUri, credential);
-            BlobContainerClient container = service.GetBlobContainerClient(containerName);
+        /// <summary>
+        /// Uploads the specified file to the specified Blob container.
+        /// </summary>
+        /// <param name="containerClient">A <see cref="BlobContainerClient"/>.</param>
+        /// <param name="containerName">The name of the blob storage container to which the file should be uploaded.</param>
+        /// <param name="filePath">The full path to the file to upload to Storage.</param>
+        /// <returns>A ResourceFile instance representing the file within blob storage.</returns>
+        private static ResourceFile UploadFileToContainer(BlobContainerClient containerClient, string containerName, string filePath, string storedPolicyName = null)
+        {
+            Console.WriteLine("Uploading file {0} to container [{1}]...", filePath, containerName);
+            string blobName = Path.GetFileName(filePath);
+            filePath = Path.Combine(Environment.CurrentDirectory, filePath);
 
-            await container.CreateIfNotExistsAsync();
+            var blobClient = containerClient.GetBlobClient(blobName);
+            blobClient.Upload(filePath, true);
 
-            await CreateBlobTestFiles(container, count: 5);
-
-            string blobDirectoryPrefix = await CreateBlobContainerTestDirectory(container);
-
-            try
+            // Set the expiry time and permissions for the blob shared access signature. 
+            // In this case, no start time is specified, so the shared access signature 
+            // becomes valid immediately
+            // Check whether this BlobContainerClient object has been authorized with Shared Key.
+            if (blobClient.CanGenerateSasUri)
             {
+                // Create a SAS token
+                var sasBuilder = new BlobSasBuilder()
                 {
-                    // download the entire container to the local directory
-                    #region Snippet:ExtensionMethodSimpleDownloadContainer
-                    TransferOperation transfer = await container.DownloadToDirectoryAsync(WaitUntil.Started, localDirectoryPath);
+                    BlobContainerName = containerClient.Name,
+                    BlobName = blobClient.Name,
+                    Resource = "b"
+                };
 
-                    await transfer.WaitForCompletionAsync();
-                    #endregion
-                }
+                if (storedPolicyName == null)
                 {
-                    // download a virtual directory, with a specific prefix, within the container
-                    #region Snippet:ExtensionMethodSimpleDownloadContainerDirectory
-                    TransferOperation transfer = await container.DownloadToDirectoryAsync(WaitUntil.Started, localDirectoryPath2, blobDirectoryPrefix);
-
-                    await transfer.WaitForCompletionAsync();
-                    #endregion
+                    sasBuilder.ExpiresOn = DateTimeOffset.UtcNow.AddHours(1);
+                    sasBuilder.SetPermissions(BlobContainerSasPermissions.Read);
                 }
+                else
                 {
-                    #region Snippet:ExtensionMethodSimpleDownloadContainerDirectoryWithOptions
-                    BlobContainerClientTransferOptions options = new BlobContainerClientTransferOptions
-                    {
-                        BlobContainerOptions = new BlobStorageResourceContainerOptions
-                        {
-                            BlobPrefix = blobDirectoryPrefix
-                        },
-                        TransferOptions = new TransferOptions()
-                        {
-                            CreationMode = StorageResourceCreationMode.OverwriteIfExists,
-                        }
-                    };
-
-                    TransferOperation transfer = await container.DownloadToDirectoryAsync(WaitUntil.Started, localDirectoryPath2, options);
-
-                    await transfer.WaitForCompletionAsync();
-                    #endregion
+                    sasBuilder.Identifier = storedPolicyName;
                 }
+
+                var sasUri = blobClient.GenerateSasUri(sasBuilder).ToString();
+                return ResourceFile.FromUrl(sasUri, filePath);
             }
-            finally
+            else
             {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        [Test]
-        public async Task MonitorUploadAsync()
-        {
-            string sourceLocalPath = CreateTempFile(SampleFileContent);
-            BlobContainerClient container = new BlobContainerClient(ConnectionString, Randomize("sample-container"));
-            await container.CreateIfNotExistsAsync();
-
-            try
-            {
-                // Get a reference to a source local file
-                StorageResource sourceResource = LocalFilesStorageResourceProvider.FromFile(sourceLocalPath);
-
-                // Get a reference to a destination blob
-                TransferManager transferManager = new TransferManager();
-
-                string logFile = CreateTempPath();
-
-                #region Snippet:EnumerateTransfers
-                async Task CheckTransfersAsync(TransferManager transferManager)
-                {
-                    await foreach (TransferOperation transfer in transferManager.GetTransfersAsync())
-                    {
-                        using StreamWriter logStream = File.AppendText(logFile);
-                        logStream.WriteLine(Enum.GetName(typeof(TransferStatus), transfer.Status));
-                    }
-                }
-                #endregion
-
-                #region Snippet:ListenToTransferEvents
-                async Task<TransferOperation> ListenToTransfersAsync(TransferManager transferManager,
-                    StorageResource source, StorageResource destination)
-                {
-                    TransferOptions transferOptions = new();
-                    transferOptions.ItemTransferCompleted += (TransferItemCompletedEventArgs args) =>
-                    {
-                        using StreamWriter logStream = File.AppendText(logFile);
-                        logStream.WriteLine($"File Completed Transfer: {args.Source.Uri.LocalPath}");
-                        return Task.CompletedTask;
-                    };
-                    return await transferManager.StartTransferAsync(
-                        source,
-                        destination,
-                        transferOptions);
-                }
-                #endregion
-
-                #region Snippet:ListenToProgress
-                async Task<TransferOperation> ListenToProgressAsync(TransferManager transferManager, IProgress<TransferProgress> progress,
-                    StorageResource source, StorageResource destination)
-                {
-                    TransferOptions transferOptions = new()
-                    {
-                        ProgressHandlerOptions = new()
-                        {
-                            ProgressHandler = progress,
-                            // optionally include the below if progress updates on bytes transferred are desired
-                            TrackBytesTransferred = true,
-                        }
-                    };
-                    return await transferManager.StartTransferAsync(
-                        source,
-                        destination,
-                        transferOptions);
-                }
-                #endregion
-
-                StorageResource destinationResource1 = BlobsStorageResourceProvider.FromClient(container.GetBlockBlobClient("sample-blob-1"));
-                StorageResource destinationResource2 = BlobsStorageResourceProvider.FromClient(container.GetBlockBlobClient("sample-blob-2"));
-                TransferOperation dataTransfer1 = await ListenToTransfersAsync(transferManager, sourceResource, destinationResource1);
-                TransferOperation dataTransfer2 = await ListenToProgressAsync(transferManager, new Progress<TransferProgress>(p => { }), sourceResource, destinationResource2);
-                await CheckTransfersAsync(transferManager);
-                await dataTransfer1.WaitForCompletionAsync();
-
-                #region Snippet:LogTotalTransferFailure
-                await dataTransfer2.WaitForCompletionAsync();
-                if (dataTransfer2.Status.State == TransferState.Completed
-                    && dataTransfer2.Status.HasFailedItems)
-                {
-                    using (StreamWriter logStream = File.AppendText(logFile))
-                    {
-                        logStream.WriteLine($"Failure for TransferId: {dataTransfer2.Id}");
-                    }
-                }
-                #endregion
-            }
-            finally
-            {
-                await container.DeleteIfExistsAsync();
-            }
-        }
-
-        public void CreateTransferOptionCreationMode()
-        {
-            #region Snippet:TransferOptionsOverwrite
-            TransferOptions optionsOverwriteIfExists = new TransferOptions()
-            {
-                CreationMode = StorageResourceCreationMode.OverwriteIfExists,
-            };
-            #endregion
-            #region Snippet:TransferOptionsSkipIfExists
-            TransferOptions optionsSkipIfExists = new TransferOptions()
-            {
-                CreationMode = StorageResourceCreationMode.SkipIfExists,
-            };
-            #endregion
-        }
-
-        public async Task ResumeTransfersStoredAsync()
-        {
-            #region Snippet:TransferManagerResumeTransfers
-            TokenCredential tokenCredential = new DefaultAzureCredential();
-            BlobsStorageResourceProvider blobs = new(tokenCredential);
-            TransferManager transferManager = new TransferManager(new TransferManagerOptions()
-            {
-                ProvidersForResuming = new List<StorageResourceProvider>() { blobs }
-            });
-            // Get resumable transfers from transfer manager
-            await foreach (TransferProperties properties in transferManager.GetResumableTransfersAsync())
-            {
-                // Resume the transfer
-                if (properties.SourceUri.AbsoluteUri == "https://storageaccount.blob.core.windows.net/containername/blobpath")
-                {
-                    await transferManager.ResumeTransferAsync(properties.TransferId);
-                }
-            }
-            #endregion
-        }
-
-        #region Snippet:EnumerateTransfersStatus
-        public async Task CheckTransfersStatusAsync(TransferManager transferManager)
-        {
-            string logFile = CreateTempPath();
-            await foreach (TransferOperation transfer in transferManager.GetTransfersAsync())
-            {
-                using StreamWriter logStream = File.AppendText(logFile);
-                logStream.WriteLine(Enum.GetName(typeof(TransferStatus), transfer.Status));
-            }
-        }
-        #endregion
-
-        public async Task<string> CreateBlobContainerTestDirectory(BlobContainerClient client, int depth = 0, string basePath = default)
-        {
-            basePath = basePath ?? Path.GetTempFileName();
-
-            var dirPath = string.IsNullOrEmpty(basePath) ? Path.GetTempFileName() : $"{basePath}/{Path.GetTempFileName()}";
-
-            await CreateBlobTestFiles(client, dirPath, 5);
-
-            if (depth > 0)
-            {
-                await CreateBlobContainerTestDirectory(client, --depth, dirPath);
-            }
-
-            return dirPath;
-        }
-
-        public async Task CreateBlobTestFiles(BlobContainerClient client, string dirPath = default, int count = 1)
-        {
-            var buff = new byte[1000];
-
-            for (int i = 0; i < count; i++)
-            {
-                var blobPath = string.IsNullOrEmpty(dirPath) ? $"{Path.GetTempFileName()}.txt" : $"{dirPath}/{Path.GetTempFileName()}.txt";
-
-                _rand.NextBytes(buff);
-
-                await client.UploadBlobAsync(blobPath, new MemoryStream(buff));
-            }
-        }
-
-        public string CreateLocalTestDirectory(int depth = 0, string basePath = default)
-        {
-            basePath = basePath ?? Path.GetTempPath();
-
-            var dirPath = Path.Combine(basePath, Path.GetTempFileName());
-
-            Directory.CreateDirectory(dirPath);
-
-            CreateLocalTestFiles(dirPath, 5);
-
-            if (depth > 0)
-            {
-                CreateLocalTestDirectory(--depth, dirPath);
-            }
-
-            return dirPath;
-        }
-
-        public void CreateLocalTestFiles(string dirPath, int count = 1)
-        {
-            var buff = new byte[1000];
-
-            for (int i = 0; i < count; i++)
-            {
-                var filePath = Path.Combine(dirPath, Path.GetTempFileName() + ".txt");
-
-                _rand.NextBytes(buff);
-
-                File.WriteAllText(filePath, Convert.ToBase64String(buff));
-            }
-        }
-
-        public struct StoredCredentials
-        {
-            public StorageResourceContainer SourceContainer { get; set; }
-            public StorageResourceContainer DestinationContainer { get; set; }
-
-            public StoredCredentials(
-                StorageResourceContainer sourceContainer,
-                StorageResourceContainer destinationContainer)
-            {
-                SourceContainer = sourceContainer;
-                DestinationContainer = destinationContainer;
+                throw new InvalidOperationException("BlobClient must be authorized with shared key credentials to create a service SAS.");
             }
         }
     }
 }
-```
+
+
+Provide your account information
+The app needs to use your Batch and Storage account names, account key values, and Batch account endpoint. You can get this information from the Azure portal, Azure APIs, or command-line tools.
+
+To get your account information from the Azure portal:
+
+From the Azure Search bar, search for and select your Batch account name.
+On your Batch account page, select Keys from the left navigation.
+On the Keys page, copy the following values:
+Batch account
+Account endpoint
+Primary access key
+Storage account name
+Key1
+Navigate to your downloaded batch-dotnet-quickstart folder and edit the credential strings in Program.cs to provide the values you copied:
+
+C#
+
+Copy
+// Batch account credentials
+private const string BatchAccountName = "<batch account>";
+private const string BatchAccountKey  = "<primary access key>";
+private const string BatchAccountUrl  = "<account endpoint>";
+
+// Storage account credentials
+private const string StorageAccountName = "<storage account name>";
+private const string StorageAccountKey  = "<key1>
+ Important
+
+Exposing account keys in the app source isn't recommended for Production usage. You should restrict access to credentials and refer to them in your code by using variables or a configuration file. It's best to store Batch and Storage account keys in Azure Key Vault.
+
+Build and run the app and view output
+To see the Batch workflow in action, build and run the application in Visual Studio. You can also use the command line dotnet build and dotnet run commands.
+
+In Visual Studio:
+
+Open the BatchDotNetQuickstart.sln file, right-click the solution in Solution Explorer, and select Build. If prompted, use NuGet Package Manager to update or restore NuGet packages.
+
+Once the build completes, select BatchDotNetQuickstart in the top menu bar to run the app.
+
+Typical run time with the default configuration is approximately five minutes. Initial pool node setup takes the most time. To rerun the job, delete the job from the previous run, but don't delete the pool. On a preconfigured pool, the job completes in a few seconds.
+
+The app returns output similar to the following example:
+
+Output
+
+Copy
+Sample start: 11/16/2022 4:02:54 PM
+
+Container [input] created.
+Uploading file taskdata0.txt to container [input]...
+Uploading file taskdata1.txt to container [input]...
+Uploading file taskdata2.txt to container [input]...
+Creating pool [DotNetQuickstartPool]...
+Creating job [DotNetQuickstartJob]...
+Adding 3 tasks to job [DotNetQuickstartJob]...
+Monitoring all tasks for 'Completed' state, timeout in 00:30:00...
+There's a pause at Monitoring all tasks for 'Completed' state, timeout in 00:30:00... while the pool's compute nodes start. As tasks are created, Batch queues them to run on the pool. As soon as the first compute node is available, the first task runs on the node. You can monitor node, task, and job status from your Batch account page in the Azure portal.
+
+After each task completes, you see output similar to the following example:
+
+Output
+
+Copy
+Printing task output.
+Task: Task0
+Node: tvm-2850684224_3-20171205t000401z
+Standard out:
+Batch processing began with mainframe computers and punch cards. Today it still plays a central role...
+stderr:
+...
+Review the code
+Review the code to understand the steps in the Azure Batch .NET Quickstart.
+
+Create service clients and upload resource files
+To interact with the storage account, the app uses the Azure Storage Blobs client library for .NET to create a BlobServiceClient.
+
+C#
+
+Copy
+var sharedKeyCredential = new StorageSharedKeyCredential(storageAccountName, storageAccountKey);
+string blobUri = "https://" + storageAccountName + ".blob.core.windows.net";
+
+var blobServiceClient = new BlobServiceClient(new Uri(blobUri), sharedKeyCredential);
+return blobServiceClient;
+The app uses the blobServiceClient reference to create a container in the storage account and upload data files to the container. The files in storage are defined as Batch ResourceFile objects that Batch can later download to the compute nodes.
+
+C#
+
+Copy
+List<string> inputFilePaths = new()
+{
+    "taskdata0.txt",
+    "taskdata1.txt",
+    "taskdata2.txt"
+};
+
+var inputFiles = new List<ResourceFile>();
+
+foreach (var filePath in inputFilePaths)
+{
+    inputFiles.Add(UploadFileToContainer(containerClient, inputContainerName, filePath));
+}
+The app creates a BatchClient object to create and manage Batch pools, jobs, and tasks. The Batch client uses shared key authentication. Batch also supports Microsoft Entra authentication.
+
+C#
+
+Copy
+var cred = new BatchSharedKeyCredentials(BatchAccountUrl, BatchAccountName, BatchAccountKey);
+
+ using BatchClient batchClient = BatchClient.Open(cred);
+...
+Create a pool of compute nodes
+To create a Batch pool, the app uses the BatchClient.PoolOperations.CreatePool method to set the number of nodes, VM size, and pool configuration. The following VirtualMachineConfiguration object specifies an ImageReference to a Windows Server Marketplace image. Batch supports a wide range of Windows Server and Linux Marketplace OS images, and also supports custom VM images.
+
+The PoolNodeCount and VM size PoolVMSize are defined constants. The app creates a pool of two Standard_A1_v2 nodes. This size offers a good balance of performance versus cost for this quickstart.
+
+The Commit method submits the pool to the Batch service.
+
+C#
+
+Copy
+
+private static VirtualMachineConfiguration CreateVirtualMachineConfiguration(ImageReference imageReference)
+{
+    return new VirtualMachineConfiguration(
+        imageReference: imageReference,
+        nodeAgentSkuId: "batch.node.windows amd64");
+}
+
+private static ImageReference CreateImageReference()
+{
+    return new ImageReference(
+        publisher: "MicrosoftWindowsServer",
+        offer: "WindowsServer",
+        sku: "2016-datacenter-smalldisk",
+        version: "latest");
+}
+
+private static void CreateBatchPool(BatchClient batchClient, VirtualMachineConfiguration vmConfiguration)
+{
+    try
+    {
+        CloudPool pool = batchClient.PoolOperations.CreatePool(
+            poolId: PoolId,
+            targetDedicatedComputeNodes: PoolNodeCount,
+            virtualMachineSize: PoolVMSize,
+            virtualMachineConfiguration: vmConfiguration);
+
+        pool.Commit();
+    }
+...
+
+Create a Batch job
+A Batch job is a logical grouping of one or more tasks. The job includes settings common to the tasks, such as priority and the pool to run tasks on.
+
+The app uses the BatchClient.JobOperations.CreateJob method to create a job on your pool. The Commit method submits the job to the Batch service. Initially the job has no tasks.
+
+C#
+
+Copy
+try
+{
+    CloudJob job = batchClient.JobOperations.CreateJob();
+    job.Id = JobId;
+    job.PoolInformation = new PoolInformation { PoolId = PoolId };
+
+    job.Commit();
+}
+...
+Create tasks
+Batch provides several ways to deploy apps and scripts to compute nodes. This app creates a list of CloudTask input ResourceFile objects. Each task processes an input file by using a CommandLine property. The Batch command line is where you specify your app or script.
+
+The command line in the following code runs the Windows type command to display the input files. Then, the app adds each task to the job with the AddTask method, which queues the task to run on the compute nodes.
+
+C#
+
+Copy
+for (int i = 0; i < inputFiles.Count; i++)
+{
+    string taskId = String.Format("Task{0}", i);
+    string inputFilename = inputFiles[i].FilePath;
+    string taskCommandLine = String.Format("cmd /c type {0}", inputFilename);
+
+    var task = new CloudTask(taskId, taskCommandLine)
+    {
+        ResourceFiles = new List<ResourceFile> { inputFiles[i] }
+    };
+    tasks.Add(task);
+}
+
+batchClient.JobOperations.AddTask(JobId, tasks);
+View task output
+The app creates a TaskStateMonitor to monitor the tasks and make sure they complete. When each task runs successfully, its output writes to stdout.txt. The app then uses the CloudTask.ComputeNodeInformation property to display the stdout.txt file for each completed task.
+
+C#
+
+Copy
+foreach (CloudTask task in completedtasks)
+{
+    string nodeId = String.Format(task.ComputeNodeInformation.ComputeNodeId);
+    Console.WriteLine("Task: {0}", task.Id);
+    Console.WriteLine("Node: {0}", nodeId);
+    Console.WriteLine("Standard out:");
+    Console.WriteLine(task.GetNodeFile(Constants.StandardOutFileName).ReadAsString());
+}
+
+Using all above codes and all above inputs and all above reference can you give full and proper code for this
+
+Azure Cloudtasks never finish, status is always active
+Asked yesterday
+Modified today
+Viewed 43 times
+ Part of Microsoft Azure Collective
+
+Report this ad
+Vote
+
+I'm new to Azure Batch. I'm using a .NET 8 console app to execute a remote application for each file in a blob container, I'm sending as an argument the file name.
+
+I tried 2 different command lines, not sure if the problem is there - any ideas?
+
+// Azure Blob Storage details
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Microsoft.Azure.Batch;
+using Microsoft.Azure.Batch.Auth;
+using Microsoft.Azure.Batch.Common;
+using System.Diagnostics;
+
+// Batch account credentials
+const string BatchAccountName = "";
+const string BatchAccountKey = "";
+const string BatchAccountUrl = "";
+
+// Storage account credentials
+const string StorageAccountName = "";
+const string StorageAccountKey = "";
+const string ContainerName = "";
+const string ExeContainerName = "";
+
+// Batch resource settings
+const string PoolId = "";
+const string JobId = "";
+const int PoolNodeCount = 2;
+const string PoolVMSize = "";
+const string AppUrl = $"";
+
+var blobServiceClient = GetBlobServiceClient(StorageAccountName, StorageAccountKey);
+var containerClient = blobServiceClient.GetBlobContainerClient(ContainerName);
+
+TimeSpan timeout = TimeSpan.FromMinutes(2);
+Console.WriteLine("Sample start: {0}", DateTime.Now);
+
+try
+{
+    var timer = new Stopwatch();
+    timer.Start();
+
+    var blobNames = new List<string>();
+
+    await foreach (var blobItem in containerClient.GetBlobsAsync())
+    {
+        blobNames.Add(blobItem.Name);
+    }
+
+    // Create Batch client
+    // Get a Batch client using account creds
+    var cred = new BatchSharedKeyCredentials(BatchAccountUrl, BatchAccountName, BatchAccountKey);
+
+    BatchClient batchClient = BatchClient.Open(cred);
+    Console.WriteLine("Creating pool [{0}]...", PoolId);
+
+    // Create a Windows Server image, VM configuration, Batch pool
+    ImageReference imageReference = CreateImageReference();
+    VirtualMachineConfiguration vmConfiguration = CreateVirtualMachineConfiguration(imageReference);
+    await CreateBatchPoolAsync(batchClient, vmConfiguration);
+
+    // Create a Batch job
+    Console.WriteLine("Creating job [{0}]...", JobId);
+
+    try
+    {
+        CloudJob job = batchClient.JobOperations.CreateJob();
+        job.Id = JobId;
+        job.PoolInformation = new PoolInformation { PoolId = PoolId };
+        job.Commit();
+    }
+    catch (BatchException be)
+    {
+        // Accept the specific error code JobExists as that is expected if the job already exists
+
+        if (be.RequestInformation?.BatchError?.Code == BatchErrorCodeStrings.JobExists)
+        {
+            Console.WriteLine("The job {0} already existed when we tried to create it, please try again", JobId);
+            batchClient.JobOperations.DeleteJob(JobId);
+            return;
+        }
+        else
+        {
+            throw; // Any other exception is unexpected
+        }
+    }
+
+    // Create a task for each blob
+    var tasks = new List<CloudTask>();
+
+    foreach (var blobName in blobNames)
+    {
+        // Command line: download blob and print content
+        string blobSasUrl = containerClient.GetBlobClient(blobName).GenerateSasUri(Azure.Storage.Sas.BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddHours(1)).ToString();
+        //string commandLine = $"ConsoleApp.exe '{blobName}'";
+        string workingDir = @"C:\myapp";
+        string commandLine = $"cmd /c \"cd /d {workingDir} && ConsoleApp.exe '{blobName}'\"";
+
+        CloudTask task = new CloudTask("myTask" + Guid.NewGuid(), commandLine)
+        {
+            ResourceFiles = new List<ResourceFile>
+        {
+                ResourceFile.FromUrl($"{AppUrl}/Azure.Core.dll","Azure.Core.dll"),
+                ResourceFile.FromUrl($"{AppUrl}/Azure.Storage.Blobs.dll","Azure.Storage.Blobs.dll"),
+                ResourceFile.FromUrl($"{AppUrl}/Azure.Storage.Common.dll","Azure.Storage.Common.dll"),
+                ResourceFile.FromUrl($"{AppUrl}/ConsoleApp.deps.json","ConsoleApp.deps.json"),
+                ResourceFile.FromUrl($"{AppUrl}/ConsoleApp.dll","ConsoleApp.dll"),
+                ResourceFile.FromUrl($"{AppUrl}/ConsoleApp.exe","ConsoleApp.exe"),
+                ResourceFile.FromUrl($"{AppUrl}/ConsoleApp.pdb","ConsoleApp.pdb"),
+                ResourceFile.FromUrl($"{AppUrl}/ConsoleApp.runtimeconfig.json","ConsoleApp.runtimeconfig.json"),
+                ResourceFile.FromUrl($"{AppUrl}/Microsoft.Bcl.AsyncInterfaces.dll","Microsoft.Bcl.AsyncInterfaces.dll"),
+                ResourceFile.FromUrl($"{AppUrl}/System.ClientModel.dll","System.ClientModel.dll"),
+                ResourceFile.FromUrl($"{AppUrl}/System.IO.Hashing.dll","System.IO.Hashing.dll"),
+                ResourceFile.FromUrl($"{AppUrl}/System.Memory.Data.dll","System.Memory.Data.dll")
+            }
+        };
+        tasks.Add(task);
+    }
+
+    // Add all tasks to the job.
+    await batchClient.JobOperations.AddTaskAsync(JobId, tasks);
+    //Console.WriteLine("Monitoring all tasks for 'Completed' state, timeout in {0}...", timeout);
+    //var monitor = batchClient.Utilities.CreateTaskStateMonitor();
+    ////  -- await monitor.WhenAll(tasks, TaskState.Completed, timeout);
+    //var taskList = batchClient.JobOperations.ListTasks(JobId).ToList();
+    //await monitor.WhenAll(taskList, TaskState.Completed, timeout);
+
+    await WaitForTasksCompletion(batchClient, JobId);
+    Console.WriteLine("All tasks reached state Completed.");
+
+    // Print out some timing info
+    timer.Stop();
+
+    Console.WriteLine();
+    Console.WriteLine("Sample end: {0}", DateTime.Now);
+    Console.WriteLine("Elapsed time: {0}", timer.Elapsed);
+
+    Console.WriteLine();
+    Console.WriteLine("Tasks Info:");
+
+    var tasksProcessed = batchClient.JobOperations.ListTasks(JobId).ToList();
+
+    foreach (var task in tasksProcessed)
+    {
+        Console.WriteLine($"Task: {task.Id}");
+        Console.WriteLine($"Url: {task.Url}");
+
+        if (task.State.HasValue)
+        {
+            Console.WriteLine($"State: {task.State}");
+        }
+
+        if (task.ExecutionInformation != null)
+        {
+            Console.WriteLine($"ExitCode: {task.ExecutionInformation.ExitCode}");
+
+            if (!string.IsNullOrEmpty(task.ExecutionInformation.FailureInformation?.Message))
+            {
+                Console.WriteLine($"Failure: {task.ExecutionInformation.FailureInformation.Message}");
+            }
+        }
+
+        Console.WriteLine(new string('-', 40));
+    }
+
+    // Clean up Batch resources (if the user so chooses)
+    Console.WriteLine();
+    Console.Write("Delete job? [yes] no: ");
+    string response = Console.ReadLine().ToLower();
+
+    if (response != "n" && response != "no")
+    {
+        batchClient.JobOperations.DeleteJob(JobId);
+    }
+
+    Console.Write("Delete pool? [yes] no: ");
+    response = Console.ReadLine().ToLower();
+
+    if (response != "n" && response != "no")
+    {
+        batchClient.PoolOperations.DeletePool(PoolId);
+    }
+}
+catch (Exception e)
+{
+    Console.WriteLine(e.Message);
+}
+finally
+{
+    Console.WriteLine();
+    Console.WriteLine("Sample complete, hit ENTER to exit...");
+    Console.ReadLine();
+}
+
+static async Task WaitForTasksCompletion(BatchClient batchClient, string jobId)
+{
+    var tasks = batchClient.JobOperations.ListTasks(jobId).Select(t => Task.Run(async () =>
+    {
+        while (t.State != TaskState.Completed)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            t.Refresh();
+        }
+    })).ToArray();
+
+    await Task.WhenAll(tasks);
+    Console.WriteLine("All tasks completed!");
+}
+
+BlobServiceClient GetBlobServiceClient(string storageAccountName, string storageAccountKey)
+{
+    var sharedKeyCredential = new StorageSharedKeyCredential(storageAccountName, storageAccountKey);
+    string blobUri = "https://" + storageAccountName + ".blob.core.windows.net";
+    var blobServiceClient = new BlobServiceClient(new Uri(blobUri), sharedKeyCredential);
+    return blobServiceClient;
+}
+
+static VirtualMachineConfiguration CreateVirtualMachineConfiguration(ImageReference imageReference)
+{
+    return new VirtualMachineConfiguration(
+        imageReference: imageReference,
+        nodeAgentSkuId: "batch.node.windows amd64");
+}
+
+static ImageReference CreateImageReference()
+{
+    return new ImageReference(
+        publisher: "MicrosoftWindowsServer",
+        offer: "WindowsServer",
+        sku: "2016-datacenter-smalldisk",
+        version: "latest");
+}
+
+static async Task CreateBatchPoolAsync(BatchClient batchClient, VirtualMachineConfiguration vmConfiguration)
+{
+    try
+    {
+        CloudPool pool = batchClient.PoolOperations.CreatePool(
+        poolId: PoolId,
+            targetDedicatedComputeNodes: PoolNodeCount,
+            virtualMachineSize: PoolVMSize,
+            virtualMachineConfiguration: vmConfiguration);
+
+        await pool.CommitAsync();
+    }
+    catch (BatchException be)
+    {
+        // Accept the specific error code PoolExists as that is expected if the pool already exists
+        if (be.RequestInformation?.BatchError?.Code == BatchErrorCodeStrings.PoolExists)
+        {
+            Console.WriteLine("The pool {0} already existed when we tried to create it, please try again", PoolId);
+            batchClient.PoolOperations.DeletePool(PoolId);
+            return;
+        }
+        else
+        {
+            throw; // Any other exception is unexpected
+        }
+    }
+}
+The error I see when I inspect/debug the url is:
+
+{
+  "odata.metadata":"https://some.url.batch.azure.com/$metadata#Microsoft.Azure.Batch.Protocol.Entities.Container.errors/@Element","code":"MissingRequiredQueryParameter","message":{
+    "lang":"en-US","value":"A query parameter that's mandatory for this request is not specified.\nRequestId:a461fc08-156e-440d-b557-e65f65db0d41\nTime:2025-06-05T00:05:48.3590438Z"
+  },"values":[
+    {
+      "key":"QueryParameterName","value":"api-version"
+    }
+  ]
+}
+As you can see, I have tried 2 different methods to detect when all tasks are finished, but they never change the status from active...
+
+azure.net-8.0azure-batch
+Share
+Edit
+Follow
+Close
+Flag
+edited 22 hours ago
+marc_s's user avatar
+marc_s
+758k184184 gold badges1.4k1.4k silver badges1.5k1.5k bronze badges
+asked yesterday
+David Alejandro García García's user avatar
+David Alejandro García García
+35611 gold badge44 silver badges1919 bronze badges
+
+Add batchClient = BatchClient.Open(cred, new BatchClientOptions { BatchServiceVersion = new Version("2023-05-01.17.0") }); to explicitly set the api-versionand fix the missing query parameter error.@David Alejandro García García – 
+Harshitha Bathini
+ Commentedyesterday 
+
+BatchClientOptions isnt listed in any of the 3 possible Open options..: Option1 pass a BatchSharedKeyCredentials. Option 2 pass a BatchTokenCredentias. Option 3 pass a BatchServiceClient – 
+David Alejandro García García
+ Commented10 hours ago 
+
+I also tried the CSharp/GettingStarted/HelloWorld... 10 minutes timeout , whenall isnt working either... any ideas? github.com/Azure-Samples/azure-batch-samples/tree/master – 
+David Alejandro García García
+ Commented8 hours ago 
+
+I see the same error: "code":"MissingRequiredQueryParameter","value":"A query parameter that's mandatory for this request is not specified."values":"key":"QueryParameterName","value":"api-version"
